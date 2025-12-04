@@ -1,165 +1,321 @@
-"""
-Professional Face Liveness Detection App
-
-Features:
-- Strict Face Visibility Checks (Mask/Hand detection)
-- Professional UI with Modern Overlay
-- Real-time Liveness Verification
-"""
-
 import cv2
 import mediapipe as mp
 import numpy as np
 import time
+import random
+from enum import Enum
 
-class LivenessApp:
+# --- Configuration & Constants ---
+class Config:
+    # Camera
+    FRAME_WIDTH = 1280
+    FRAME_HEIGHT = 720
+    
+    # Face Mesh
+    MIN_DETECTION_CONFIDENCE = 0.7
+    MIN_TRACKING_CONFIDENCE = 0.7
+    
+    # Thresholds
+    EAR_THRESHOLD = 0.25      # Increased from 0.22 (easier to trigger)
+    MAR_THRESHOLD = 0.45      # Mouth Aspect Ratio for smile
+    HEAD_YAW_THRESHOLD = 20   # Degrees for head turn
+    
+    # Challenge Config
+    CHALLENGES = {
+        "Blink Your Eyes": {"threshold": 0.25, "hold": 0.1},  # Very short hold for blink
+        "Smile Broadly":   {"threshold": 0.1, "hold": 0.5},  # Lowered from 0.45
+        "Turn Head Left":  {"threshold": 40,   "hold": 0.5},
+        "Turn Head Right": {"threshold": 40,   "hold": 0.5}
+    }
+    
+    CHALLENGE_TIME_LIMIT = 10.0  # Increased to give more time
+    
+    # Colors (BGR)
+    COLOR_BG = (30, 30, 30)
+    COLOR_TEXT = (255, 255, 255)
+    COLOR_ACCENT = (0, 255, 127)    # Spring Green
+    COLOR_WARNING = (0, 140, 255)   # Orange
+    COLOR_ERROR = (0, 0, 255)       # Red
+    COLOR_SUCCESS = (0, 255, 0)     # Green
+
+# --- Enums ---
+class AppState(Enum):
+    INITIALIZING = 0
+    WAITING_FOR_FACE = 1
+    ALIGNING_FACE = 2
+    CHALLENGE_ACTIVE = 3
+    VERIFIED = 4
+    FAILED = 5
+
+class ChallengeType(Enum):
+    BLINK = "Blink Your Eyes"
+    SMILE = "Smile Broadly"
+    TURN_LEFT = "Turn Head Left"
+    TURN_RIGHT = "Turn Head Right"
+
+# --- Helper Classes ---
+
+class FaceMeshDetector:
     def __init__(self):
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
             refine_landmarks=True,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7
+            min_detection_confidence=Config.MIN_DETECTION_CONFIDENCE,
+            min_tracking_confidence=Config.MIN_TRACKING_CONFIDENCE
         )
-        
-        # Parameters
-        self.EAR_THRESHOLD = 0.22
-        self.BLINK_CONSEC_FRAMES = 2
-        self.FACE_OVAL_INDICES = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
-        
-        # State
-        self.blink_count = 0
-        self.blink_counter = 0
-        self.is_liveness_verified = False
-        self.warning_message = ""
-        self.warning_timer = 0
-        
-        # Colors (BGR)
-        self.COLOR_SUCCESS = (0, 255, 100)   # Modern Green
-        self.COLOR_WARNING = (0, 140, 255)   # Orange
-        self.COLOR_ERROR = (0, 0, 255)       # Red
-        self.COLOR_TEXT = (255, 255, 255)    # White
-        self.COLOR_BG = (30, 30, 30)         # Dark Gray
 
-    def calculate_ear(self, landmarks, width, height):
+    def process(self, frame):
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return self.face_mesh.process(rgb_frame)
+
+    @staticmethod
+    def get_landmarks(results, w, h):
+        if results.multi_face_landmarks:
+            return results.multi_face_landmarks[0].landmark
+        return None
+
+class GeometryUtils:
+    @staticmethod
+    def calculate_ear(landmarks, w, h):
+        """Calculate Eye Aspect Ratio"""
+        # Left eye indices
         left_eye = [33, 160, 158, 133, 153, 144]
+        # Right eye indices
         right_eye = [362, 385, 387, 263, 373, 380]
         
         def eye_ratio(indices):
-            pts = [np.array([landmarks[i].x * width, landmarks[i].y * height]) for i in indices]
-            vertical_1 = np.linalg.norm(pts[1] - pts[5])
-            vertical_2 = np.linalg.norm(pts[2] - pts[4])
-            horizontal = np.linalg.norm(pts[0] - pts[3])
-            return (vertical_1 + vertical_2) / (2.0 * horizontal)
+            pts = [np.array([landmarks[i].x * w, landmarks[i].y * h]) for i in indices]
+            # Vertical distances
+            v1 = np.linalg.norm(pts[1] - pts[5])
+            v2 = np.linalg.norm(pts[2] - pts[4])
+            # Horizontal distance
+            h_dist = np.linalg.norm(pts[0] - pts[3])
+            return (v1 + v2) / (2.0 * h_dist) if h_dist > 0 else 0
         
         return (eye_ratio(left_eye) + eye_ratio(right_eye)) / 2.0
 
-    def check_obstruction(self, landmarks, width, height):
-        """Strict check for face obstruction"""
-        warnings = []
+    @staticmethod
+    def calculate_mar(landmarks, w, h):
+        """Calculate Mouth Aspect Ratio"""
+        # Mouth indices
+        upper_lip = [13, 81, 311] # Top, left-mid, right-mid
+        lower_lip = [14, 178, 402] # Bottom, left-mid, right-mid
+        corners = [61, 291] # Left corner, Right corner
         
-        # 1. Check Mouth Visibility (Lips shouldn't be covered)
-        # Upper lip: 13, Lower lip: 14
-        upper_lip = landmarks[13]
-        lower_lip = landmarks[14]
+        pts_upper = np.array([landmarks[13].x * w, landmarks[13].y * h])
+        pts_lower = np.array([landmarks[14].x * w, landmarks[14].y * h])
+        pts_left = np.array([landmarks[61].x * w, landmarks[61].y * h])
+        pts_right = np.array([landmarks[291].x * w, landmarks[291].y * h])
         
-        # If lips are too close to nose or chin, might be mask
-        nose_tip = landmarks[1]
-        chin = landmarks[152]
+        vertical = np.linalg.norm(pts_upper - pts_lower)
+        horizontal = np.linalg.norm(pts_left - pts_right)
         
-        face_vertical = chin.y - nose_tip.y
-        mouth_nose_dist = upper_lip.y - nose_tip.y
-        
-        # Mask detection logic: if mouth area is flat or textureless (simplified via geometry)
-        # Better proxy: Check if mouth landmarks are compressed or erratic
-        if mouth_nose_dist < face_vertical * 0.1: 
-            warnings.append("Remove Mask / Mouth Covered")
+        return vertical / horizontal if horizontal > 0 else 0
 
-        # 2. Check Eye Visibility
-        # If eyes are not detected well, MediaPipe usually fails, but we can check confidence
-        # Here we check if eyes are unnaturally closed for too long (handled by blink logic)
-        
-        # 3. Hand over face check (Depth anomaly)
-        # Z-coordinate check: Hands are usually closer than face
-        nose_z = nose_tip.z
-        # Check cheek points
-        left_cheek = landmarks[234]
-        right_cheek = landmarks[454]
-        
-        # If significant depth variance across face plane
-        if abs(left_cheek.z - right_cheek.z) > 0.1:
-            warnings.append("Face Obstructed / Remove Hand")
+    @staticmethod
+    def get_head_pose(landmarks, w, h):
+        """Estimate head pose (yaw, pitch, roll)"""
+        # 3D model points
+        model_points = np.array([
+            (0.0, 0.0, 0.0),             # Nose tip
+            (0.0, -330.0, -65.0),        # Chin
+            (-225.0, 170.0, -135.0),     # Left eye left corner
+            (225.0, 170.0, -135.0),      # Right eye right corner
+            (-150.0, -150.0, -125.0),    # Left Mouth corner
+            (150.0, -150.0, -125.0)      # Right mouth corner
+        ])
 
-        return warnings
+        # Image points
+        image_points = np.array([
+            (landmarks[1].x * w, landmarks[1].y * h),     # Nose tip
+            (landmarks[152].x * w, landmarks[152].y * h), # Chin
+            (landmarks[263].x * w, landmarks[263].y * h), # Left eye left corner
+            (landmarks[33].x * w, landmarks[33].y * h),   # Right eye right corner
+            (landmarks[291].x * w, landmarks[291].y * h), # Left Mouth corner
+            (landmarks[61].x * w, landmarks[61].y * h)    # Right mouth corner
+        ], dtype="double")
 
-    def check_position(self, landmarks, width, height):
-        warnings = []
-        forehead = landmarks[10]
-        chin = landmarks[152]
+        focal_length = w
+        center = (w / 2, h / 2)
+        camera_matrix = np.array([
+            [focal_length, 0, center[0]],
+            [0, focal_length, center[1]],
+            [0, 0, 1]
+        ], dtype="double")
+
+        dist_coeffs = np.zeros((4, 1))
+        success, rotation_vector, translation_vector = cv2.solvePnP(
+            model_points, image_points, camera_matrix, dist_coeffs
+        )
+
+        # Calculate Euler angles
+        rmat, jac = cv2.Rodrigues(rotation_vector)
         
-        # Vertical Position
-        face_h = (chin.y - forehead.y) * height
-        if face_h < height * 0.35: warnings.append("Move Closer")
-        elif face_h > height * 0.85: warnings.append("Move Back")
+        # cv2.RQDecomp3x3 returns different number of values depending on version
+        # We only need the first value (Euler angles)
+        ret = cv2.RQDecomp3x3(rmat)
+        angles = ret[0]
+
+        # angles[0] = pitch, angles[1] = yaw, angles[2] = roll
+        return angles[0] * 360, angles[1] * 360, angles[2] * 360
+
+# --- Main Application ---
+
+class LivenessApp:
+    def __init__(self):
+        self.detector = FaceMeshDetector()
+        self.state = AppState.INITIALIZING
+        self.challenges = []
+        self.current_challenge_idx = 0
+        self.challenge_start_time = 0
+        self.success_start_time = 0 # For holding a pose
+        self.message = "Initializing..."
+        self.sub_message = ""
         
-        # Centering
+        # Initialize challenges
+        self.reset_challenges()
+
+    def reset_challenges(self):
+        # Pick 3 random challenges
+        all_challenges = [
+            ChallengeType.BLINK,
+            ChallengeType.SMILE,
+            ChallengeType.TURN_LEFT,
+            ChallengeType.TURN_RIGHT
+        ]
+        self.challenges = random.sample(all_challenges, 3)
+        self.current_challenge_idx = 0
+        self.state = AppState.WAITING_FOR_FACE
+
+    def check_face_alignment(self, landmarks, w, h):
+        """Check if face is centered and at correct distance"""
         nose = landmarks[1]
-        if nose.x < 0.35 or nose.x > 0.65: warnings.append("Center Your Face")
         
-        return warnings
+        # Center check
+        if nose.x < 0.35 or nose.x > 0.65:
+            return False, "Center your face"
+        
+        # Distance check (using face height)
+        top = landmarks[10].y
+        bottom = landmarks[152].y
+        face_height = bottom - top
+        
+        if face_height < 0.3:
+            return False, "Move Closer"
+        if face_height > 0.8:
+            return False, "Move Back"
+            
+        return True, "Perfect"
 
-    def draw_modern_ui(self, frame, status_text, status_color, info_text):
+    def process_challenge(self, challenge, landmarks, w, h):
+        """Check if current challenge is met"""
+        is_met = False
+        cfg = Config.CHALLENGES[challenge.value]
+        
+        if challenge == ChallengeType.BLINK:
+            ear = GeometryUtils.calculate_ear(landmarks, w, h)
+            if ear < cfg["threshold"]:
+                is_met = True
+                
+        elif challenge == ChallengeType.SMILE:
+            mar = GeometryUtils.calculate_mar(landmarks, w, h)
+            if mar > cfg["threshold"]:
+                is_met = True
+                
+        elif challenge == ChallengeType.TURN_LEFT:
+            pitch, yaw, roll = GeometryUtils.get_head_pose(landmarks, w, h)
+            if yaw < -cfg["threshold"]:
+                is_met = True
+                
+        elif challenge == ChallengeType.TURN_RIGHT:
+            pitch, yaw, roll = GeometryUtils.get_head_pose(landmarks, w, h)
+            if yaw > cfg["threshold"]:
+                is_met = True
+                
+        return is_met
+
+    def draw_ui(self, frame):
         h, w = frame.shape[:2]
         
-        # 1. Top Status Bar (Glassmorphism effect)
+        # 1. Background Overlay for Text
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, 80), self.COLOR_BG, -1)
-        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+        cv2.rectangle(overlay, (0, 0), (w, 120), Config.COLOR_BG, -1)
+        cv2.addWeighted(overlay, 0.9, frame, 0.1, 0, frame)
         
-        # Status Text with Shadow
+        # 2. Main Message
         font = cv2.FONT_HERSHEY_DUPLEX
-        scale = 1.2
+        scale = 1.5
         thick = 2
-        text_size = cv2.getTextSize(status_text, font, scale, thick)[0]
+        
+        # Determine color based on state
+        color = Config.COLOR_TEXT
+        if self.state == AppState.VERIFIED: color = Config.COLOR_SUCCESS
+        elif self.state == AppState.FAILED: color = Config.COLOR_ERROR
+        elif self.state == AppState.CHALLENGE_ACTIVE: color = Config.COLOR_ACCENT
+        
+        text_size = cv2.getTextSize(self.message, font, scale, thick)[0]
         text_x = (w - text_size[0]) // 2
+        cv2.putText(frame, self.message, (text_x, 60), font, scale, color, thick, cv2.LINE_AA)
         
-        # Shadow
-        cv2.putText(frame, status_text, (text_x+2, 52), font, scale, (0,0,0), thick, cv2.LINE_AA)
-        # Main Text
-        cv2.putText(frame, status_text, (text_x, 50), font, scale, status_color, thick, cv2.LINE_AA)
+        # 3. Sub Message
+        if self.sub_message:
+            scale_sub = 0.8
+            text_size_sub = cv2.getTextSize(self.sub_message, font, scale_sub, 1)[0]
+            text_x_sub = (w - text_size_sub[0]) // 2
+            cv2.putText(frame, self.sub_message, (text_x_sub, 100), font, scale_sub, (200, 200, 200), 1, cv2.LINE_AA)
+
+        # 4. Progress Bar (if in challenge mode)
+        if self.state == AppState.CHALLENGE_ACTIVE:
+            total_challenges = len(self.challenges)
+            bar_w = 300
+            bar_h = 10
+            bar_x = (w - bar_w) // 2
+            bar_y = 110
+            
+            # Background bar
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50, 50, 50), -1)
+            
+            # Filled bar
+            fill_w = int(bar_w * (self.current_challenge_idx / total_challenges))
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), Config.COLOR_ACCENT, -1)
+            
+            # Timer bar (shrinking)
+            time_left = max(0, Config.CHALLENGE_TIME_LIMIT - (time.time() - self.challenge_start_time))
+            timer_ratio = time_left / Config.CHALLENGE_TIME_LIMIT
+            timer_w = int(w * timer_ratio)
+            cv2.rectangle(frame, (0, h-10), (timer_w, h), Config.COLOR_WARNING, -1)
+
+    def draw_debug_info(self, frame, landmarks, w, h):
+        """Draw real-time values for debugging"""
+        if not landmarks: return
         
-        # 2. Bottom Info Bar
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, h-60), (w, h), self.COLOR_BG, -1)
-        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+        ear = GeometryUtils.calculate_ear(landmarks, w, h)
+        mar = GeometryUtils.calculate_mar(landmarks, w, h)
+        pitch, yaw, roll = GeometryUtils.get_head_pose(landmarks, w, h)
         
-        cv2.putText(frame, info_text, (30, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1, cv2.LINE_AA)
+        y_start = 150
+        line_height = 25
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.6
+        color = (0, 255, 255) # Yellow
         
-        # 3. Corner Brackets (Viewfinder look)
-        color = status_color
-        length = 40
-        thick = 4
-        margin = 30
+        lines = [
+            f"DEBUG VALUES:",
+            f"EAR: {ear:.3f} (Blink < {Config.EAR_THRESHOLD})",
+            f"MAR: {mar:.3f} (Smile > {Config.MAR_THRESHOLD})",
+            f"YAW: {yaw:.1f} (Turn > {Config.HEAD_YAW_THRESHOLD})",
+            f"PITCH: {pitch:.1f}",
+            f"ROLL: {roll:.1f}"
+        ]
         
-        # Top-Left
-        cv2.line(frame, (margin, margin), (margin+length, margin), color, thick)
-        cv2.line(frame, (margin, margin), (margin, margin+length), color, thick)
-        # Top-Right
-        cv2.line(frame, (w-margin, margin), (w-margin-length, margin), color, thick)
-        cv2.line(frame, (w-margin, margin), (w-margin, margin+length), color, thick)
-        # Bottom-Left
-        cv2.line(frame, (margin, h-margin), (margin+length, h-margin), color, thick)
-        cv2.line(frame, (margin, h-margin), (margin, h-margin-length), color, thick)
-        # Bottom-Right
-        cv2.line(frame, (w-margin, h-margin), (w-margin-length, h-margin), color, thick)
-        cv2.line(frame, (w-margin, h-margin), (w-margin, h-margin-length), color, thick)
+        for i, line in enumerate(lines):
+            cv2.putText(frame, line, (10, y_start + i*line_height), font, scale, color, 1, cv2.LINE_AA)
 
     def run(self):
         cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        
-        print("Starting Professional Liveness Detection...")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, Config.FRAME_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.FRAME_HEIGHT)
         
         while cap.isOpened():
             ret, frame = cap.read()
@@ -167,61 +323,109 @@ class LivenessApp:
             
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.face_mesh.process(rgb)
             
-            status_text = "Align Face"
-            status_color = self.COLOR_WARNING
+            results = self.detector.process(frame)
+            landmarks = self.detector.get_landmarks(results, w, h)
             
-            if results.multi_face_landmarks:
-                landmarks = results.multi_face_landmarks[0].landmark
-                
-                # Checks
-                pos_warnings = self.check_position(landmarks, w, h)
-                obs_warnings = self.check_obstruction(landmarks, w, h)
-                all_warnings = pos_warnings + obs_warnings
-                
-                if all_warnings:
-                    self.warning_message = all_warnings[0]
-                    self.warning_timer = time.time()
-                    status_text = self.warning_message
-                    status_color = self.COLOR_ERROR
+            # State Machine Logic
+            if self.state == AppState.WAITING_FOR_FACE:
+                self.message = "Looking for Face..."
+                self.sub_message = "Please step in front of the camera"
+                if landmarks:
+                    self.state = AppState.ALIGNING_FACE
+            
+            elif self.state == AppState.ALIGNING_FACE:
+                if landmarks:
+                    aligned, msg = self.check_face_alignment(landmarks, w, h)
+                    self.message = msg
+                    self.sub_message = "Align your face in the center"
+                    if aligned:
+                        # Start Challenges
+                        self.state = AppState.CHALLENGE_ACTIVE
+                        self.current_challenge_idx = 0
+                        self.challenge_start_time = time.time()
+                        self.success_start_time = 0
                 else:
-                    if time.time() - self.warning_timer > 1.5:
-                        self.warning_message = ""
-                        
-                        # Liveness Logic
-                        ear = self.calculate_ear(landmarks, w, h)
-                        if ear < self.EAR_THRESHOLD:
-                            self.blink_counter += 1
-                        else:
-                            if self.blink_counter >= self.BLINK_CONSEC_FRAMES:
-                                self.blink_count += 1
-                                self.is_liveness_verified = True
-                            self.blink_counter = 0
-                        
-                        if self.is_liveness_verified:
-                            status_text = "VERIFIED"
-                            status_color = self.COLOR_SUCCESS
-                        else:
-                            status_text = "Blink Eyes"
-                            status_color = self.COLOR_WARNING
+                    self.state = AppState.WAITING_FOR_FACE
+            
+            elif self.state == AppState.CHALLENGE_ACTIVE:
+                if not landmarks:
+                    self.state = AppState.WAITING_FOR_FACE
+                    continue
                 
-                # Draw Oval Guide
-                oval_pts = [np.array([landmarks[i].x * w, landmarks[i].y * h]).astype(int) for i in self.FACE_OVAL_INDICES]
-                cv2.polylines(frame, [np.array(oval_pts)], True, status_color, 2, cv2.LINE_AA)
+                # Check Timeout
+                if time.time() - self.challenge_start_time > Config.CHALLENGE_TIME_LIMIT:
+                    self.state = AppState.FAILED
+                    self.message = "Time Out!"
+                    self.sub_message = "Press 'R' to retry"
+                    continue
                 
-            else:
-                status_text = "No Face Detected"
-                status_color = self.COLOR_ERROR
+                current_challenge = self.challenges[self.current_challenge_idx]
+                challenge_name = current_challenge.value
+                challenge_cfg = Config.CHALLENGES[challenge_name]
+                
+                self.message = challenge_name
+                self.sub_message = f"Challenge {self.current_challenge_idx + 1}/{len(self.challenges)}"
+                
+                # Verify Challenge
+                if self.process_challenge(current_challenge, landmarks, w, h):
+                    if self.success_start_time == 0:
+                        self.success_start_time = time.time()
+                    
+                    # Calculate progress
+                    hold_duration = challenge_cfg["hold"]
+                    elapsed = time.time() - self.success_start_time
+                    
+                    # Visual feedback for holding
+                    if hold_duration > 0.1: # Only show for long holds
+                        progress = min(1.0, elapsed / hold_duration)
+                        cv2.rectangle(frame, (0, h-20), (int(w * progress), h), Config.COLOR_SUCCESS, -1)
+                        self.sub_message = "Perfect! Hold it..."
+                    
+                    # Check if completed
+                    if elapsed > hold_duration:
+                        self.current_challenge_idx += 1
+                        self.success_start_time = 0
+                        self.challenge_start_time = time.time() # Reset timer for next challenge
+                        
+                        if self.current_challenge_idx >= len(self.challenges):
+                            self.state = AppState.VERIFIED
+                            self.message = "LIVENESS VERIFIED"
+                            self.sub_message = "Access Granted"
+                else:
+                    self.success_start_time = 0 # Reset hold if they lose the pose
+            
+            elif self.state == AppState.VERIFIED:
+                # Stay verified until reset
+                pass
+                
+            elif self.state == AppState.FAILED:
+                # Wait for reset
+                pass
             
             # Draw UI
-            info = f"Blinks: {self.blink_count} | Verified: {'YES' if self.is_liveness_verified else 'NO'}"
-            self.draw_modern_ui(frame, status_text, status_color, info)
+            self.draw_ui(frame)
+            if landmarks:
+                self.draw_debug_info(frame, landmarks, w, h)
             
-            cv2.imshow('Liveness Check', frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
+            # Draw Face Mesh (Optional, for debug or cool effect)
+            if landmarks:
+                mp.solutions.drawing_utils.draw_landmarks(
+                    image=frame,
+                    landmark_list=results.multi_face_landmarks[0],
+                    connections=mp.solutions.face_mesh.FACEMESH_TESSELATION,
+                    landmark_drawing_spec=None,
+                    connection_drawing_spec=mp.solutions.drawing_styles.get_default_face_mesh_tesselation_style()
+                )
             
+            cv2.imshow('Active Liveness Detection', frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('r'):
+                self.reset_challenges()
+
         cap.release()
         cv2.destroyAllWindows()
 
